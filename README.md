@@ -93,11 +93,11 @@ CrowdSec Console (веб-панель, опционально) — `cscli consol
 ### 5. Caddy (второй слой)
 
 Таймер раз в минуту собирает IP из `awgsec-block list` + решений CrowdSec и пишет
-`/etc/caddy/blocklist.caddy`. В Caddyfile нужна одна строка внутри site-блока:
+`/etc/caddy/blocklist/blocklist.caddy`. В Caddyfile нужна одна строка внутри site-блока:
 
 ```
 newserv.1121440.ru {
-    import /etc/caddy/blocklist.caddy
+    import /etc/caddy/blocklist/blocklist.caddy
     reverse_proxy amnezia:80 { header_up Host {host} }
 }
 ```

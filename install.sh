@@ -27,7 +27,7 @@ readonly SEC_BIN="/usr/local/sbin/awgsec-block"
 readonly SEC_LIST="${SEC_DIR}/blocked.txt"
 readonly NFT_TABLE="awgsec"
 readonly NFT_SET="blocked_ipv4"
-readonly CADDY_BLOCK="/etc/caddy/blocklist.caddy"
+readonly CADDY_BLOCK="/etc/caddy/blocklist/blocklist.caddy"
 
 # ── значения по умолчанию ────────────────────────────────────────────────────
 DRY_RUN=0
@@ -210,7 +210,8 @@ cmd_del() {
 
 cmd_list() {
   ensure_table
-  nft -j list set inet $TABLE $SET 2>/dev/null | jq -r '.nftables[]?.elem?.elem[]?.val // empty' | sort
+  nft -j list set inet $TABLE $SET 2>/dev/null \
+    | jq -r '.nftables[]? | select(has("set")) | .set.elem[]? | .elem.val // empty' | sort
 }
 
 cmd_restore() {
@@ -374,9 +375,13 @@ setup_crowdsec() {
   if ! command -v cscli >/dev/null; then
     run install -d -m 0755 /etc/apt/keyrings
     if (( ! DRY_RUN )); then
-      curl -fsSL https://packagecloud.io/crowdsec/crowdsec/gpgkey \
-        | gpg --dearmor -o /etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg
-      echo "deb [signed-by=/etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg] https://packagecloud.io/crowdsec/crowdsec/any any" \
+      # gpg без --batch пытается открыть /dev/tty и падает в неинтерактивном ssh
+      if [[ ! -s /etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg ]]; then
+        curl -fsSL https://packagecloud.io/crowdsec/crowdsec/gpgkey \
+          | gpg --batch --yes --no-tty --dearmor -o /etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg
+      fi
+      # packagecloud требует SUITE + COMPONENT: «.../any/ any main»
+      echo "deb [signed-by=/etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg] https://packagecloud.io/crowdsec/crowdsec/any/ any main" \
         > /etc/apt/sources.list.d/crowdsec_crowdsec.list
       apt-get update -qq
     else
@@ -418,19 +423,33 @@ EOF
       sed -i 's/^mode:.*/mode: nftables/' "$bouncer_cfg" || true
 
       # api_key баунсера: пакет не всегда регистрирует его сам при неинтерактивной установке
-      if grep -qE '^[[:space:]]*api_key:[[:space:]]*$' "$bouncer_cfg"; then
+      if grep -qE '^[[:space:]]*api_key:[[:space:]]*(\$\{API_KEY\}|)$' "$bouncer_cfg"; then
         local bkey
         bkey=$(cscli bouncers add crowdsec-firewall-bouncer -o raw 2>/dev/null) || {
           cscli bouncers delete crowdsec-firewall-bouncer >/dev/null 2>&1 || true
           bkey=$(cscli bouncers add crowdsec-firewall-bouncer -o raw 2>/dev/null) || bkey=""
         }
         if [[ -n "$bkey" ]]; then
+          # Ключ пишем и в .yaml, и в .yaml.local: пакет кладёт рядом локальный
+          # оверрайд, и он ПЕРЕКРЫВАЕТ основной файл — со старым ключом баунсер
+          # стартует и падает с «API error: access forbidden».
           sed -i "s|^[[:space:]]*api_key:.*|api_key: ${bkey}|" "$bouncer_cfg"
+          if [[ -f "${bouncer_cfg}.local" ]]; then
+            if grep -qE '^[[:space:]]*api_key:' "${bouncer_cfg}.local"; then
+              sed -i "s|^[[:space:]]*api_key:.*|api_key: ${bkey}|" "${bouncer_cfg}.local"
+            else
+              printf 'api_key: %s\n' "$bkey" >>"${bouncer_cfg}.local"
+            fi
+          fi
           ok "баунсер зарегистрирован в CrowdSec"
         else
           warn "не удалось получить api_key баунсера — сделай: cscli bouncers add crowdsec-firewall-bouncer"
         fi
       fi
+
+      # Пакет ставит condition на этот файл, пока баунсер не зарегистрирован —
+      # с ним systemd просто не запускает сервис («unmet condition»).
+      rm -f /var/lib/crowdsec/pending-registration
 
       systemctl enable crowdsec-firewall-bouncer
       systemctl restart crowdsec-firewall-bouncer
@@ -454,7 +473,8 @@ setup_caddy() {
 #!/usr/bin/env bash
 # Собирает забаненные IP из awgsec-набора и решений CrowdSec → Caddy-сниппет
 set -euo pipefail
-OUT=/etc/caddy/blocklist.caddy
+OUT=/etc/caddy/blocklist/blocklist.caddy
+mkdir -p /etc/caddy/blocklist
 TMP=$(mktemp)
 
 ips=$(
