@@ -399,6 +399,42 @@ PY
   run chmod 644 "$PANEL_DIR/docker-compose.yml" "$PANEL_DIR/Caddyfile" 2>/dev/null || true
   ok "файлы панели разложены (права 600 на ключи)"
 
+  # Compose со старой машины может быть старше вкладки «Безопасность»: без этих
+  # монтирований панель поднимется, но не увидит nginx-конфиг, логи и очередь
+  # блокировок. Дописываем недостающее, не переписывая файл.
+  step "Монтирования в compose"
+  if (( DRY_RUN )); then
+    printf '%s    + проверить ./nginx, ./logs, ./security в docker-compose.yml%s\n' "$C_D" "$C_0"
+  else
+    python3 - "$PANEL_DIR/docker-compose.yml" <<'PY'
+import re, sys
+path = sys.argv[1]
+s = open(path, encoding="utf-8").read()
+needed = [
+    ("./nginx:/etc/nginx/http.d", "      - ./nginx:/etc/nginx/http.d\n"),
+    ("./logs:/var/log/nginx", "      - ./logs:/var/log/nginx\n"),
+    ("./security:/var/lib/awgsec", "      - ./security:/var/lib/awgsec\n"),
+]
+missing = [(k, line) for k, line in needed if k not in s]
+if not missing:
+    print("  ✓ nginx, logs, security уже смонтированы")
+else:
+    # точка вставки — строка с монтированием amnezia, иначе первый volumes:
+    anchor = re.search(r"^[ \t]*- \./amnezia:/etc/amnezia[ \t]*$", s, re.M)
+    if anchor:
+        pos = anchor.end() + 1
+        s = s[:pos] + "".join(line for _, line in missing) + s[pos:]
+    else:
+        m = re.search(r"^[ \t]*volumes:[ \t]*$", s, re.M)
+        if not m:
+            sys.exit("  ✗ в compose нет volumes: — добавь монтирования вручную")
+        pos = m.end() + 1
+        s = s[:pos] + "".join(line for _, line in missing) + s[pos:]
+    open(path, "w", encoding="utf-8").write(s)
+    print("  ✓ добавлено: " + ", ".join(k for k, _ in missing))
+PY
+  fi
+
   if [[ -n "$DOMAIN" ]]; then
     step "Домен в Caddyfile"
     if (( DRY_RUN )); then
