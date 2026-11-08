@@ -14,6 +14,7 @@
 #   ./install.sh install [--dry-run] [--owner-ips 1.2.3.4,5.6.7.8]
 #                        [--panel-log /opt/my-wg-panel/logs/access.log]
 #                        [--no-crowdsec] [--no-fail2ban] [--no-bbr] [--no-caddy]
+#                        [--with-kernel-module]
 #   ./install.sh status
 #   ./install.sh uninstall
 #
@@ -35,6 +36,7 @@ DO_BBR=1
 DO_FAIL2BAN=1
 DO_CROWDSEC=1
 DO_CADDY=1
+DO_KERNEL_MODULE=0
 PANEL_LOG="/opt/my-wg-panel/logs/access.log"
 OWNER_IPS=""
 PANEL_DIR="/opt/my-wg-panel/security"
@@ -73,7 +75,7 @@ write_file() {
 }
 
 # ── аргументы ────────────────────────────────────────────────────────────────
-usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 
 CMD="${1:-}"
 [[ -z "$CMD" || "$CMD" == "-h" || "$CMD" == "--help" ]] && usage
@@ -86,6 +88,7 @@ while (( $# )); do
     --no-fail2ban)  DO_FAIL2BAN=0 ;;
     --no-crowdsec)  DO_CROWDSEC=0 ;;
     --no-caddy)     DO_CADDY=0 ;;
+    --with-kernel-module) DO_KERNEL_MODULE=1 ;;
     --panel-log)    PANEL_LOG="${2:?--panel-log требует путь}"; shift ;;
     --owner-ips)    OWNER_IPS="${2:?--owner-ips требует список}"; shift ;;
     --panel-dir)    PANEL_DIR="${2:?--panel-dir требует путь}"; shift ;;
@@ -659,6 +662,17 @@ case "$CMD" in
     setup_crowdsec
     setup_caddy
     setup_panel_agent
+
+    if (( DO_KERNEL_MODULE )); then
+      step "Модуль ядра AmneziaWG (сборка под это ядро)"
+      local kscript
+      kscript="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/kernel-module/install-amneziawg-kernel.sh"
+      if [[ -x "$kscript" ]]; then
+        "$kscript" || warn "модуль не собрался — панель останется в userspace-режиме (это рабочий вариант)"
+      else
+        warn "не найден $kscript"
+      fi
+    fi
     echo
     log "Готово. Проверка: $0 status"
     ;;

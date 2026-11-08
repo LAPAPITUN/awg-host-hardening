@@ -21,9 +21,9 @@ import subprocess
 import sys
 import time
 
-CONF_PATH = "/etc/awgsec/panel-agent.conf"
-AWGSEC_BLOCK = "/usr/local/sbin/awgsec-block"
-SOURCES_FILE = "/etc/awgsec/sources.tsv"
+CONF_PATH = os.environ.get("AWGSEC_CONF", "/etc/awgsec/panel-agent.conf")
+AWGSEC_BLOCK = os.environ.get("AWGSEC_BLOCK_BIN", "/usr/local/sbin/awgsec-block")
+SOURCES_FILE = os.environ.get("AWGSEC_SOURCES", "/etc/awgsec/sources.tsv")
 
 DEFAULTS = {
     "PANEL_DIR": "/opt/my-wg-panel/security",
