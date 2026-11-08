@@ -37,6 +37,7 @@ DO_CROWDSEC=1
 DO_CADDY=1
 PANEL_LOG="/opt/my-wg-panel/logs/access.log"
 OWNER_IPS=""
+PANEL_DIR="/opt/my-wg-panel/security"
 
 # ── вывод ────────────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -87,6 +88,7 @@ while (( $# )); do
     --no-caddy)     DO_CADDY=0 ;;
     --panel-log)    PANEL_LOG="${2:?--panel-log требует путь}"; shift ;;
     --owner-ips)    OWNER_IPS="${2:?--owner-ips требует список}"; shift ;;
+    --panel-dir)    PANEL_DIR="${2:?--panel-dir требует путь}"; shift ;;
     -h|--help)      usage ;;
     *) err "неизвестный флаг: $1"; exit 2 ;;
   esac
@@ -166,6 +168,7 @@ setup_nft() {
 set -euo pipefail
 SEC_DIR=/etc/awgsec
 LIST="$SEC_DIR/blocked.txt"
+SOURCES="$SEC_DIR/sources.tsv"
 TABLE=awgsec
 SET=blocked_ipv4
 
@@ -190,14 +193,18 @@ normalize() {
 }
 
 cmd_add() {
-  local ip ttl="${2:-86400}"
+  local ip ttl="${2:-86400}" src="${3:-manual}"
   ip=$(normalize "$1") || exit 1
   mkdir -p "$SEC_DIR"; touch "$LIST"
   ensure_table
   nft add element inet $TABLE $SET "{ $ip timeout ${ttl}s }" 2>/dev/null || \
     nft add element inet $TABLE $SET "{ $ip }"
   if ! grep -qx "$ip" "$LIST" 2>/dev/null; then echo "$ip" >>"$LIST"; fi
-  echo "blocked $ip (ttl ${ttl}s)"
+  # Источник бана — для панели (fail2ban:awg-panel-scan, crowdsec, panel, manual)
+  if ! grep -q "^${ip}	" "$SOURCES" 2>/dev/null; then
+    printf '%s\t%s\t%s\n' "$ip" "$src" "$(date +%s)" >>"$SOURCES"
+  fi
+  echo "blocked $ip (ttl ${ttl}s, source ${src})"
 }
 
 cmd_del() {
@@ -205,6 +212,7 @@ cmd_del() {
   ip=$(normalize "$1") || exit 1
   nft delete element inet $TABLE $SET "{ $ip }" 2>/dev/null || true
   if [[ -f "$LIST" ]]; then sed -i "\|^${ip//./\\.}$|d" "$LIST"; fi
+  if [[ -f "$SOURCES" ]]; then sed -i "\|^${ip//./\\.}[[:space:]]|d" "$SOURCES"; fi
   echo "unblocked $ip"
 }
 
@@ -284,6 +292,9 @@ setup_fail2ban() {
 # Лог панели: $remote_addr - $remote_user [...] "request" status bytes "referer" "ua" "xff"
 # Реальный IP клиента — последнее поле. Ловим неуспешную авторизацию.
 failregex = ^\S+ - \S+ \[[^\]]+\] "[^"]*" (?:401|403) \d+ "[^"]*" "[^"]*" "<HOST>"\s*$
+# Без datepattern fail2ban не разбирает формат nginx «08/Nov/2026:19:22:03»
+# и молча пропускает ВСЕ строки (проверено fail2ban-regex: 0 matched из 215).
+datepattern = %%d/%%b/%%Y:%%H:%%M:%%S
 ignoreregex =
 EOF
 
@@ -291,6 +302,7 @@ EOF
 [Definition]
 # Сканеры путей: .env, .git, phpinfo, wp-*, docker-compose.yml, .aws, .ssh и т.п.
 failregex = ^\S+ - \S+ \[[^\]]+\] "[A-Z]+ /(?:\.env|\.git|\.aws|\.ssh|\.svn|wp-|wordpress|phpinfo|info\.php|i\.php|p\.php|pinfo\.php|server-info|docker-compose\.yml|env-config\.js|cpanel|actuator|vendor/|_profiler|webroot|laravel|xmlrpc\.php)[^"]*" \d+ \d+ "[^"]*" "[^"]*" "<HOST>"\s*$
+datepattern = %%d/%%b/%%Y:%%H:%%M:%%S
 ignoreregex =
 EOF
 
@@ -300,7 +312,7 @@ EOF
 actionstart =
 actionstop  =
 actioncheck =
-actionban   = /usr/local/sbin/awgsec-block add <ip> <bantime>
+actionban   = /usr/local/sbin/awgsec-block add <ip> <bantime> f2b:<name>
 actionunban = /usr/local/sbin/awgsec-block del <ip>
 
 [Init]
@@ -537,6 +549,57 @@ EOF
   ok "таймер awgsec-sync-caddy активен"
 }
 
+# ── 7. Агент панели (вкладка «Безопасность») ─────────────────────────────────
+setup_panel_agent() {
+  step "Агент панели: заявки из вкладки «Безопасность»"
+  local src_dir agent_src
+  src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  agent_src="${src_dir}/panel-agent/awgsec-panel-agent"
+
+  if [[ ! -f "$agent_src" ]]; then
+    warn "не найден ${agent_src} — агент панели пропущен (клонируй репозиторий целиком)"
+    return
+  fi
+
+  run install -m 0755 "$agent_src" /usr/local/sbin/awgsec-panel-agent
+  run mkdir -p "$PANEL_DIR"
+
+  write_file /etc/awgsec/panel-agent.conf <<EOF
+# Каталог, смонтированный в контейнер панели как /var/lib/awgsec
+PANEL_DIR=${PANEL_DIR}
+# Лог nginx панели на хосте (для счётчиков сканов)
+ACCESS_LOG=/opt/my-wg-panel/logs/access.log
+EOF
+
+  write_file /etc/systemd/system/awgsec-panel-agent.service <<'EOF'
+[Unit]
+Description=awgsec: apply panel blocklist requests
+After=nftables.service docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/awgsec-panel-agent
+EOF
+
+  write_file /etc/systemd/system/awgsec-panel-agent.timer <<'EOF'
+[Unit]
+Description=awgsec: apply panel blocklist requests every 10s
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=10s
+AccuracySec=2s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  run systemctl daemon-reload
+  run systemctl enable --now awgsec-panel-agent.timer
+  run systemctl start awgsec-panel-agent.service || true
+  ok "агент панели активен (каталог ${PANEL_DIR})"
+}
+
 # ── status ───────────────────────────────────────────────────────────────────
 cmd_status() {
   echo "awg-host-hardening v${VERSION}"
@@ -545,6 +608,7 @@ cmd_status() {
   echo -n "nft set:  "
   nft list set inet "$NFT_TABLE" "$NFT_SET" >/dev/null 2>&1 && echo "активна" || echo "НЕТ"
   echo "забанено (awgsec): $("$SEC_BIN" list 2>/dev/null | wc -l)"
+  echo "агент панели: $(systemctl is-active awgsec-panel-agent.timer 2>/dev/null)"
   echo
   if command -v fail2ban-client >/dev/null; then
     echo "fail2ban: $(systemctl is-active fail2ban 2>/dev/null)"
@@ -568,8 +632,10 @@ cmd_status() {
 cmd_uninstall() {
   step "Снятие защиты"
   run systemctl disable --now awgsec-sync-caddy.timer 2>/dev/null || true
+  run systemctl disable --now awgsec-panel-agent.timer 2>/dev/null || true
   run systemctl disable --now awgsec-restore.service 2>/dev/null || true
   run rm -f /etc/systemd/system/awgsec-sync-caddy.{service,timer} /etc/systemd/system/awgsec-restore.service
+  run rm -f /etc/systemd/system/awgsec-panel-agent.{service,timer} /usr/local/sbin/awgsec-panel-agent
   run systemctl daemon-reload
   run nft delete table inet "$NFT_TABLE" 2>/dev/null || true
   run rm -f /etc/sysctl.d/99-awgsec-bbr.conf /etc/modules-load.d/awgsec-bbr.conf
@@ -592,6 +658,7 @@ case "$CMD" in
     setup_fail2ban
     setup_crowdsec
     setup_caddy
+    setup_panel_agent
     echo
     log "Готово. Проверка: $0 status"
     ;;

@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""awgsec-panel-agent — мост между панелью AmneziaWG и блокировками на хосте.
+
+Панель живёт в контейнере с cap_drop: ALL и своим netns, поэтому nftables она
+трогать не может. Схема:
+
+    панель  --(заявка)-->  <PANEL_DIR>/requests.jsonl
+    агент (этот скрипт, systemd timer раз в 10 с):
+        * применяет заявки через /usr/local/sbin/awgsec-block
+        * пишет <PANEL_DIR>/state.json   (его читает панель)
+        * пишет <PANEL_DIR>/blocked.txt  (резервный список)
+    панель  <--(чтение)--   state.json
+
+Запускается таймером; ручной запуск: awgsec-panel-agent [--once].
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+CONF_PATH = "/etc/awgsec/panel-agent.conf"
+AWGSEC_BLOCK = "/usr/local/sbin/awgsec-block"
+SOURCES_FILE = "/etc/awgsec/sources.tsv"
+
+DEFAULTS = {
+    "PANEL_DIR": "/opt/my-wg-panel/security",
+    "ACCESS_LOG": "/opt/my-wg-panel/logs/access.log",
+    "MAX_HITS_SCAN": "200000",   # сколько последних строк лога смотреть
+}
+
+# Пути, по которым видно сканеров (совпадает с nginx-правилом return 444)
+SCANNER_RE = re.compile(
+    r'"(?:GET|POST|HEAD|PUT) /(?:\.env|\.git|\.aws|\.ssh|\.svn|\.DS_Store|wp-|wordpress'
+    r'|xmlrpc\.php|phpinfo|info\.php|i\.php|p\.php|pinfo\.php|server-info'
+    r'|docker-compose\.ya?ml|env-config\.js|cpanel|actuator|vendor/|_profiler'
+    r'|webroot|laravel|backup)',
+    re.IGNORECASE,
+)
+# Последнее поле лога — реальный IP клиента (X-Forwarded-For от Caddy)
+LAST_FIELD_RE = re.compile(r'"([0-9]{1,3}(?:\.[0-9]{1,3}){3})"\s*$')
+
+
+def load_conf():
+    conf = dict(DEFAULTS)
+    if os.path.exists(CONF_PATH):
+        with open(CONF_PATH, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                conf[key.strip()] = value.strip().strip('"').strip("'")
+    return conf
+
+
+def run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def apply_queue(panel_dir):
+    """Применяет заявки панели. Возвращает число обработанных."""
+    queue = os.path.join(panel_dir, "requests.jsonl")
+    if not os.path.exists(queue) or os.path.getsize(queue) == 0:
+        return 0
+
+    # Переименовываем: новые заявки пишутся в свежий файл и не теряются
+    work = queue + ".work"
+    try:
+        os.replace(queue, work)
+    except OSError:
+        return 0
+
+    applied = 0
+    try:
+        with open(work, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    req = json.loads(line)
+                except ValueError:
+                    continue
+                action = req.get("action")
+                ip = str(req.get("ip", "")).strip()
+                if not ip:
+                    continue
+                if action == "block":
+                    ttl = int(req.get("ttl") or 86400)
+                    ttl = max(60, min(ttl, 2592000))
+                    run([AWGSEC_BLOCK, "add", ip, str(ttl), "panel"])
+                elif action == "unblock":
+                    run([AWGSEC_BLOCK, "del", ip])
+                else:
+                    continue
+                applied += 1
+    finally:
+        try:
+            os.remove(work)
+        except OSError:
+            pass
+    return applied
+
+
+def read_sources():
+    """ip -> source из журнала источников (пишет awgsec-block)."""
+    sources = {}
+    if not os.path.exists(SOURCES_FILE):
+        return sources
+    try:
+        with open(SOURCES_FILE, encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 2 and parts[0]:
+                    sources[parts[0]] = parts[1]
+    except OSError:
+        pass
+    return sources
+
+
+def nft_blocks():
+    """Текущие элементы набора: [(ip, expires_in_sec|None)]."""
+    result = run(["nft", "-j", "list", "set", "inet", "awgsec", "blocked_ipv4"])
+    if not result or result.returncode != 0:
+        return []
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        return []
+    out = []
+    for item in data.get("nftables", []):
+        st = item.get("set")
+        if not st:
+            continue
+        for element in st.get("elem") or []:
+            body = element.get("elem") or {}
+            ip = body.get("val")
+            if ip:
+                out.append((ip, body.get("expires")))
+    return out
+
+
+def crowdsec_blocks():
+    """IP из решений CrowdSec (у него своя nft-таблица)."""
+    result = run(["cscli", "decisions", "list", "-o", "json"])
+    if not result or result.returncode != 0:
+        return []
+    try:
+        data = json.loads(result.stdout or "[]")
+    except ValueError:
+        return []
+    ips = []
+    if isinstance(data, list):
+        for item in data:
+            for decision in (item.get("decisions") or []):
+                ip = decision.get("value")
+                if ip:
+                    ips.append(ip)
+    return ips
+
+
+def access_log_stats(log_path, limit):
+    """Сканы за 24 часа, уникальные IP, счётчики попаданий по IP."""
+    stats = {"scans_24h": 0, "scan_ips_24h": 0}
+    hits = {}
+    if not log_path or not os.path.exists(log_path):
+        return stats, hits
+
+    day_ago = time.time() - 86400
+    scan_ips = set()
+    checked = 0
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                checked += 1
+                if checked > limit:
+                    break
+                match = LAST_FIELD_RE.search(line)
+                ip = match.group(1) if match else None
+                if ip:
+                    hits[ip] = hits.get(ip, 0) + 1
+                if not SCANNER_RE.search(line):
+                    continue
+                stats["scans_24h"] += 1
+                if ip:
+                    scan_ips.add(ip)
+    except OSError:
+        pass
+    stats["scan_ips_24h"] = len(scan_ips)
+    return stats, hits
+
+
+def dropped_packets():
+    result = run(["nft", "list", "chain", "inet", "awgsec", "prerouting"])
+    if not result or result.returncode != 0:
+        return None
+    match = re.search(r"counter packets (\d+)", result.stdout)
+    return int(match.group(1)) if match else None
+
+
+def write_atomic(path, text):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def main():
+    conf = load_conf()
+    panel_dir = conf["PANEL_DIR"]
+    log_path = conf["ACCESS_LOG"]
+    try:
+        limit = int(conf.get("MAX_HITS_SCAN") or 200000)
+    except ValueError:
+        limit = 200000
+
+    if not os.path.isdir(panel_dir):
+        print(f"каталог панели не найден: {panel_dir}", file=sys.stderr)
+        return 1
+
+    applied = apply_queue(panel_dir)
+    sources = read_sources()
+    stats, hits = access_log_stats(log_path, limit)
+    stats["dropped_packets"] = dropped_packets()
+
+    now = int(time.time())
+    entries = []
+    for ip, expires in nft_blocks():
+        source = sources.get(ip, "unknown")
+        entries.append({
+            "ip": ip,
+            "source": source,
+            "hits": hits.get(ip, 0),
+            "expires_at": (now + int(expires)) if expires else None,
+        })
+
+    # CrowdSec банит в своей таблице — показываем и его решения
+    known = {e["ip"] for e in entries}
+    for ip in crowdsec_blocks():
+        if ip in known:
+            continue
+        entries.append({"ip": ip, "source": "crowdsec", "hits": hits.get(ip, 0), "expires_at": None})
+
+    entries.sort(key=lambda e: (-(e.get("hits") or 0), e["ip"]))
+
+    state = {"updated": now, "entries": entries, "stats": stats}
+    write_atomic(os.path.join(panel_dir, "state.json"), json.dumps(state, ensure_ascii=False, indent=1))
+    write_atomic(os.path.join(panel_dir, "blocked.txt"),
+                 "".join(e["ip"] + "\n" for e in entries if e["source"] != "crowdsec"))
+
+    if applied:
+        print(f"применено заявок: {applied}; заблокировано: {len(entries)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
