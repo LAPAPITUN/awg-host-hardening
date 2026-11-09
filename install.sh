@@ -321,6 +321,16 @@ actionunban = /usr/local/sbin/awgsec-block del <ip>
 [Init]
 EOF
 
+  # ignorecommand: не банить IP, с которого уже была успешная авторизация
+  write_file /usr/local/sbin/awg-panel-auth-ok <<'EOF'
+#!/usr/bin/env bash
+ip="${1:-}"
+log="${PANEL_LOG:-/opt/my-wg-panel/logs/access.log}"
+[[ -n "$ip" && -r "$log" ]] || exit 1
+tail -n 5000 "$log" 2>/dev/null | awk -v ip="$ip" '$1 == ip && $3 != "-" && $9 == 200 { ok = 1 } END { exit(ok ? 0 : 1) }'
+EOF
+  run chmod 0755 /usr/local/sbin/awg-panel-auth-ok
+
   local panel_jails=""
   if [[ -f "$PANEL_LOG" ]]; then
     panel_jails=$(cat <<EOF
@@ -330,9 +340,10 @@ enabled  = true
 filter   = awg-panel-auth
 logpath  = ${PANEL_LOG}
 backend  = polling
-maxretry = 5
+maxretry = 8
 findtime = 10m
 bantime  = 24h
+ignorecommand = /usr/local/sbin/awg-panel-auth-ok <ip>
 action   = awgsec
 
 [awg-panel-scan]
@@ -650,7 +661,7 @@ cmd_uninstall() {
   run systemctl daemon-reload
   run nft delete table inet "$NFT_TABLE" 2>/dev/null || true
   run rm -f /etc/sysctl.d/99-awgsec-bbr.conf /etc/modules-load.d/awgsec-bbr.conf
-  run rm -f /etc/fail2ban/jail.local /etc/fail2ban/filter.d/awg-panel-*.conf /etc/fail2ban/action.d/awgsec.conf
+  run rm -f /etc/fail2ban/jail.local /etc/fail2ban/filter.d/awg-panel-*.conf /etc/fail2ban/action.d/awgsec.conf /usr/local/sbin/awg-panel-auth-ok
   run systemctl restart fail2ban 2>/dev/null || true
   run rm -rf "$SEC_DIR" "$SEC_BIN" /usr/local/sbin/awgsec-sync-caddy "$CADDY_BLOCK"
   warn "CrowdSec не удаляется автоматически: apt purge crowdsec crowdsec-firewall-bouncer"
