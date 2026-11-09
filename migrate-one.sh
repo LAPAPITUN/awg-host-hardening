@@ -18,6 +18,7 @@
 #   --proxy CMD           ProxyCommand для старой машины, напр.
 #                         'nc -X 5 -x 127.0.0.1:1081 %h %p'
 #   --new-ip IP           внешний IP этой машины                [определит сам]
+#   --owner-ip IP         твой IP (не банить fail2ban); лучше указать
 #   --keep-security       перенести блок-лист /etc/awgsec
 #   --pull-only           только забрать бандл со старого (без импорта)
 #   --yes                 не задавать вопросов
@@ -37,7 +38,7 @@ REMOTE_DIR="/root/awg-host-hardening"
 BUNDLE="/root/panel-migrate.tgz"
 
 OLD_HOST=""; OLD_USER="root"; OLD_PORT="22"; OLD_PASS=""; OLD_KEY=""; OLD_PROXY=""
-NEW_IP=""; DO_IMPORT=1; KEEP_SECURITY=0; ASSUME_YES=0; DRY_RUN=0; PULL_ONLY=0
+NEW_IP=""; OWNER_IP=""; DO_IMPORT=1; KEEP_SECURITY=0; ASSUME_YES=0; DRY_RUN=0; PULL_ONLY=0
 
 C_0=$'\033[0m'; C_B=$'\033[1m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_R=$'\033[31m'; C_D=$'\033[2m'
 step() { printf '\n%s== %s ==%s\n' "$C_B" "$*" "$C_0"; }
@@ -59,6 +60,7 @@ while [[ $# -gt 0 ]]; do
     --key)            OLD_KEY="${2:?}"; shift ;;
     --proxy)          OLD_PROXY="${2:?}"; shift ;;
     --new-ip)         NEW_IP="${2:?}"; shift ;;
+    --owner-ip)       OWNER_IP="${2:?}"; shift ;;
     --keep-security)  KEEP_SECURITY=1 ;;
     --pull-only)      PULL_ONLY=1 ;;
     --yes|-y)         ASSUME_YES=1 ;;
@@ -206,7 +208,9 @@ do_import() {
   fi
 
   step "Импорт и запуск"
-  "$TOOLS_DIR/migrate.sh" import --bundle "$BUNDLE" --force 2>&1 | tail -30
+  local extra=()
+  if [[ -n "$OWNER_IP" ]]; then extra+=(--owner-ips "$OWNER_IP"); fi
+  "$TOOLS_DIR/migrate.sh" import --bundle "$BUNDLE" --force "${extra[@]}" 2>&1 | tail -30
 }
 
 # ── 5. Проверка ──────────────────────────────────────────────────────────────

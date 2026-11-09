@@ -294,7 +294,7 @@ setup_fail2ban() {
 [Definition]
 # Лог панели: $remote_addr - $remote_user [...] "request" status bytes "referer" "ua" "xff"
 # Реальный IP клиента — последнее поле. Ловим неуспешную авторизацию.
-failregex = ^\S+ - \S+ \[[^\]]+\] "[^"]*" (?:401|403) \d+ "[^"]*" "[^"]*" "<HOST>"\s*$
+failregex = ^\S+ - \S+ \[[^\]]+\] "(?!.*/(?:static|favicon\.ico|site\.webmanifest))[^"]*" (?:401|403) \d+ "[^"]*" "[^"]*" "<HOST>"\s*$
 # Без datepattern fail2ban не разбирает формат nginx «08/Nov/2026:19:22:03»
 # и молча пропускает ВСЕ строки (проверено fail2ban-regex: 0 matched из 215).
 datepattern = %%d/%%b/%%Y:%%H:%%M:%%S

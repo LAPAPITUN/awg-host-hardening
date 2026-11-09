@@ -18,6 +18,7 @@
 #
 # Флаги:
 #   --to user@host        целевая машина (migrate)
+#   --owner-ips LIST      твои IP через запятую: не банятся fail2ban
 #   --panel-dir PATH      каталог панели (по умолчанию /opt/my-wg-panel)
 #   --out PATH            путь к бандлу (export)
 #   --bundle PATH         путь к бандлу (import/inspect)
@@ -68,6 +69,7 @@ run()  { if (( DRY_RUN )); then printf '%s    + %s%s\n' "$C_D" "$*" "$C_0"; else
 
 usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 
+OWNER_IPS=""
 CMD="${1:-}"
 [[ -z "$CMD" || "$CMD" == "-h" || "$CMD" == "--help" ]] && usage
 shift || true
@@ -87,6 +89,7 @@ while (( $# )); do
     --force)           FORCE=1 ;;
     --no-start)        NO_START=1 ;;
     --dry-run)         DRY_RUN=1 ;;
+    --owner-ips)       OWNER_IPS="${2:?--owner-ips требует список}"; shift ;;
     -h|--help)         usage ;;
     *) err "неизвестный флаг: $1"; exit 2 ;;
   esac
@@ -507,6 +510,7 @@ PY
     if [[ -x "$stage/tool/install.sh" ]]; then
       local extra=()
       (( KERNEL_MODULE )) && extra+=(--with-kernel-module)
+      if [[ -n "$OWNER_IPS" ]]; then extra+=(--owner-ips "$OWNER_IPS"); fi
       (( DRY_RUN )) && extra+=(--dry-run)
       run bash "$stage/tool/install.sh" install --panel-dir "$PANEL_DIR/security" "${extra[@]}"
     else
