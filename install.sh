@@ -479,6 +479,14 @@ EOF
 setup_caddy() {
   step "Caddy: блок-лист как второй слой"
   (( DO_CADDY )) || { warn "пропущено (--no-caddy)"; return; }
+  # Caddyfile импортирует /etc/caddy/blocklist/blocklist.caddy; пустой файл обязателен,
+  # иначе Caddy падает в цикле и панель недоступна (проявляется при переезде).
+  local panel_root; panel_root="$(dirname "$PANEL_DIR")"
+  if [[ -d "$panel_root" ]]; then
+    mkdir -p "$panel_root/blocklist"
+    [[ -f "$panel_root/blocklist/blocklist.caddy" ]] \
+      || printf '# managed by awgsec\n' >"$panel_root/blocklist/blocklist.caddy"
+  fi
   command -v docker >/dev/null || { warn "docker не найден — слой Caddy пропущен"; return; }
   docker ps --format '{{.Names}}' 2>/dev/null | grep -qx caddy || {
     warn "контейнер caddy не запущен — слой пропущен"; return
@@ -665,7 +673,6 @@ case "$CMD" in
 
     if (( DO_KERNEL_MODULE )); then
       step "Модуль ядра AmneziaWG (сборка под это ядро)"
-      local kscript
       kscript="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/kernel-module/install-amneziawg-kernel.sh"
       if [[ -x "$kscript" ]]; then
         "$kscript" || warn "модуль не собрался — панель останется в userspace-режиме (это рабочий вариант)"

@@ -20,6 +20,28 @@ BBR, nftables, fail2ban, CrowdSec, агент панели, модуль ядр�
 
 Подробно, включая переключение DNS и риск «endpoint = IP»: [docs/MIGRATION.md](docs/MIGRATION.md).
 
+### Совсем одна команда (с любой машины, где есть root)
+
+Запускать **на новой машине**:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/LAPAPITUN/awg-host-hardening/master/migrate-one.sh | bash
+```
+
+Скрипт спросит адрес старой машины и доступ к ней (ключ подхватит сам, иначе попросит
+пароль), поставит docker и зависимости, заберёт бандл состояния со старого сервера,
+развернёт панель, хост-защиту, модуль ядра и сертификат, затем прогонит `verify`.
+Старая машина не останавливается — откат это возврат DNS.
+
+Если старая машина недоступна из РФ, дай прокси для SSH:
+
+```bash
+bash migrate-one.sh --old 1.2.3.4 --proxy 'nc -X 5 -x 127.0.0.1:1081 %h %p'
+```
+
+Прочие флаги: `--key PATH`, `--port N`, `--new-ip IP`, `--keep-security`,
+`--pull-only`, `--yes`, `--dry-run`.
+
 ## Быстрый старт
 
 ```bash
